@@ -99,7 +99,7 @@ public:
 	bool initGlobalSymbols();
 
 	bool addTypes();
-	bool addSrcLines();
+	bool addSrcLines(SymbolList sl);
 	bool addSrcLines14();
 	bool addPublics(SymbolList sl);
 

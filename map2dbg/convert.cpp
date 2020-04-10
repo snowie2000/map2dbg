@@ -11,6 +11,8 @@
 #include "convert.h"
 #include "pdb.h"
 
+#include <regex>
+
 //---------------------------------------------------------------------------
 
 //============================================================================
@@ -138,11 +140,13 @@ public:
 	}
 
 	bool AddSymbol(unsigned short seg, unsigned long offset, std::string symbol);
+	bool AddSrcLine(unsigned short seg, unsigned long offset, std::string lineoff, std::string srcfile);
 	bool End(); // to flush the thing to disk.
 	std::string err;
 
 protected:
 	SymbolList symlist;
+	SymbolList linelist;
 	std::string fnexe, fndbg; // keep a copy of the arguments to the constructor. We don't init until later.
 	std::string modname;
 	unsigned int szModName;
@@ -199,6 +203,19 @@ bool TDebugFile::EnsureStarted() {
 	return true;
 }
 
+bool TDebugFile::AddSrcLine(unsigned short seg, unsigned long offset, std::string lineoff, std::string srcfile) {
+	EnsureStarted();
+	PSYMBOL sym = new SYMBOL;
+	memset(sym, 0, sizeof SYMBOL);
+	sym->name = srcfile+"+"+lineoff;
+	sym->offset = offset;
+	sym->seg = seg;
+	sym->type = S_LABEL_V3;
+	int index = 0;
+
+	linelist.push_back(sym);
+	return true;
+}
 
 bool TDebugFile::AddSymbol(unsigned short seg, unsigned long offset, std::string symbol) {
 	EnsureStarted();
@@ -208,11 +225,14 @@ bool TDebugFile::AddSymbol(unsigned short seg, unsigned long offset, std::string
 	sym->offset = offset;
 	sym->seg = seg;
 	sym->type = S_PUB32;
-
-	int index = sym->name.find("..", 0);
-	if (index != std::string::npos) 
-		/* Make the replacement. */
-		sym->name.replace(index, 2, ".");
+	int index = 0;
+	while (true) {
+		index = sym->name.find("..", index);
+		if (index != std::string::npos)/* Make the replacement. */
+			sym->name.replace(index, 2, ".");
+		else
+			break;
+	}
 
 	symlist.push_back(sym);
 	return true;
@@ -267,8 +287,8 @@ bool TDebugFile::End() {
 	if (!pdb.addTypes())
 		fatal(SARG ": %s", pdbname, pdb.getLastError());
 
-	//if (!pdb.addSrcLines())
-	//	fatal(SARG ": %s", pdbname, pdb.getLastError());
+	if (!pdb.addSrcLines(linelist))
+		fatal(SARG ": %s", pdbname, pdb.getLastError());
 
 	if (!pdb.addPublics(symlist))
 		fatal(SARG ": %s", pdbname, pdb.getLastError());
@@ -458,7 +478,7 @@ public:
 	TMapFile(std::string fnmap);
 
 	bool GetSymbol(unsigned short *aseg, unsigned long *aoff, std::string *aname);
-
+	bool GetSrcLine(TDebugFile* df);
 	bool isok;
 	bool ismangled;
 	size_t line;
@@ -497,6 +517,89 @@ TMapFile::TMapFile(std::string fnmap) {
 		s = str.at(i);
 		ismangled = (s.find_first_of("@") != std::string::npos);
 	}
+// 	// load line number information
+// 
+// 	for (size_t i = line; i < str.size(); i++) {
+// 		s = str.at(i);
+// 		size_t pos = s.find("Line numbers for");
+// 		size_t invalid_pos = std::string::npos;
+// 		if (pos != invalid_pos) {
+// 			line = i;
+// 			
+// 
+// 		}
+// 	}
+// 	line++; // to skip past that header
+}
+
+
+bool TMapFile::GetSrcLine(TDebugFile* df) {
+	if (line == 0)
+		return false;
+	if (err != "")
+		return false;
+	--line;
+
+	if (line == str.size())
+		return false;
+	std::string s = str.at(line);
+	unsigned long aseg;
+	unsigned long aoff; 
+	unsigned long lineoff;
+	std::string aname;
+	//example of some lines:
+	// Line numbers for IdURI(IdURI.pas) segment .text
+	// 139 0001:0012F71C   140 0001 : 0012F731   141 0001 : 0012F73A   142 0001 : 0012F749
+	while (true) {
+		s = str.at(line++);
+		if (line < str.size() && s.size() == 0) continue;
+
+		if (s[0] != ' ' && s[0] != 'L' && (s[0] > '9' || s[0] < '0'))
+			return false;	// iterated through all line number info
+		if (s[0] == 'L') {
+			// new source file info
+			int namestart=0;
+			for (size_t i = 17; i < s.size(); ++i) {
+				if (s[i] == '(') {
+					namestart = i;
+				}				
+				if (s[i] == ')' && namestart) {
+					aname = s.substr(namestart+1, i - namestart-1);	// extract source name;
+					//printf("Processing unit %s\n", aname.c_str());
+					while (line < str.size() && str.at(line) == "")	// fast forward to segment info
+						line++;
+					s = str.at(line);
+					break;
+				}
+			}
+		}
+
+		std::smatch m;
+		std::regex e("(\\d+) (\\d+):(\\w+)");
+		int start = 0;
+		int i;
+		bool found;
+		do {
+			std::string fragment = s.substr(start, 20);
+			found = std::regex_search(fragment, m, e);
+			if (found) {
+				i = sscanf_s(m[1].str().c_str(), "%d", &lineoff);
+				if (i != 1)
+					return false;
+				i = sscanf_s(m[2].str().c_str(), "%x", &aseg);
+				if (i != 1)
+					return false;
+				i = sscanf_s(m[3].str().c_str(), "%x", &aoff);
+				if (i != 1)
+					return false;
+				if (aseg > 0xFFFF)
+					return false;
+				df->AddSrcLine(aseg, aoff, m[1].str(), aname);
+			}
+			start += 20;
+		} while (found);
+	}
+	return true;
 }
 
 bool TMapFile::GetSymbol(unsigned short *aseg, unsigned long *aoff, std::string *aname) {
@@ -581,6 +684,7 @@ int convert(std::string exe, std::string &err) {
 	int num=mf->num;
 	TDebugFile *df = new TDebugFile(exe,dbg);
 	bool anymore=true;
+	printf("parsing symbols\r\n");
 	while (anymore) { 
 		unsigned short seg;
 		unsigned long off;
@@ -590,8 +694,12 @@ int convert(std::string exe, std::string &err) {
 			if (name.size()>0)                   //skip empty names
 				anymore=df->AddSymbol(seg,off,name); // stop it upon error
 	}
+	printf("parsing line numbers\r\n");
+	mf->GetSrcLine(df);
 	delete mf;
+	printf("writing to pdb\r\n");
 	bool dres=df->End();
+	printf("done\r\n");
 	std::string derr=df->err;
 	delete df;
 	if (!dres) {

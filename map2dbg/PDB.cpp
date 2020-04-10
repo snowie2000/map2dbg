@@ -599,11 +599,48 @@ int PDB::getNextSrcLine(int seg, unsigned int off)
 
 	return off + segMapDesc[s].offset;
 }
-
+/*
 bool PDB::addSrcLines()
 {
 	if (mspdb::vsVersion >= 14)
 		return addSrcLines14();
+
+	return true;
+}*/
+
+bool PDB::addSrcLines(SymbolList sl)
+{
+	OMFDirEntry entry;
+	entry.SubSection = sstGlobalPub;
+	entry.iMod = 0xFFFF;
+
+	mspdb::Mod* mod = 0;
+	if (entry.iMod < countEntries)
+		mod = useGlobalMod ? globalMod() : modules[entry.iMod];
+
+	OMFSymHash header;
+	header.cbSymbol = sl.size(); //gpoSym - sizeof(OMFSymHash);
+	header.symhash = 0; // No symbol or address hash tables...
+	header.addrhash = 0;
+	header.cbHSym = 0;
+	header.cbHAddr = 0;
+	PSYMBOL* symlist = sl.data();
+	for (unsigned int i = 0; i < header.cbSymbol; i++)
+	{
+		//length = sym->generic.len + 2;
+		//if (!sym->generic.id || length < 4)
+		//	break;
+		SYMBOL& sym = *symlist[i];
+		int rc;
+		//dsym2c((BYTE*)sym->data_v1.p_name.name, sym->data_v1.p_name.namelen, symname, sizeof(symname));
+		int type = translateType(sym.type);
+		if (mod)
+			rc = mod->AddPublic2(sym.name.c_str(), sym.seg, sym.offset, type);
+		else
+			rc = dbi->AddPublic2(sym.name.c_str(), sym.seg, sym.offset, type);
+		if (rc <= 0)
+			return setError("cannot add public");
+	}
 
 	return true;
 }
@@ -660,6 +697,102 @@ bool PDB::addSrcLines14()
 	if (!useGlobalMod)
 		return setError("unexpected call of addSrcLines14()");
 
+
+	std::vector<char> F2_buf; // lines
+	std::vector<char> F2_all; // multiple f2 blocks
+	std::vector<char> F3_buf; // filenames
+	std::vector<char> F4_buf; // file checksums
+
+	append(F3_buf, (char)0); // empty string
+
+	mspdb::Mod* mod = globalMod();
+	if (!mod)
+		return setError("sstSrcModule for non-existing module");
+
+	OMFSourceModule testmod = {0};
+	testmod.cFile = 1;
+	testmod.cSeg = 1;
+
+	OMFSourceModule* sourceModule = &testmod;
+
+	for (int f = 0; f < sourceModule->cFile; f++)
+	{
+		//int cvoff = entry->lfo + sourceModule->baseSrcFile[f];
+		OMFSourceFile sourceFile = { 0 };
+		sourceFile.cSeg = 1;
+
+		//int* lnSegStartEnd = img.CVP<int>(cvoff + 4 + 4 * sourceFile.cSeg);
+		char* name = "E:\\ §À„\\WoCai2\\Form\\ufmMain.pas";
+
+		int fileid = addfile(F3_buf, F4_buf, name);
+
+		for (int s = 0; s < sourceFile.cSeg; s++)
+		{
+			//int lnoff = entry->lfo + sourceFile.baseSrcLn[s];
+			unsigned short lines[] = {179};
+
+			//OMFSourceLine* sourceLine = img.CVP<OMFSourceLine>(lnoff);
+			unsigned short* lineNo = lines; //img.CVP<unsigned short>(lnoff + 4 + 4 * sourceLine->cLnOff);
+
+			int seg = 1;// sourceLine->Seg;
+			int cnt = 1;// sourceLine->cLnOff;
+			if (cnt <= 0)
+				continue;
+
+			int segoff = 0x00CF78E0;//lnSegStartEnd[2 * s];
+			// lnSegStartEnd[2*s + 1] only spans until the first byte of the last source line
+			int segend = 0x00CF78E8;//getNextSrcLine(seg, sourceLine->offset[cnt - 1]);
+			int seglength = segend - 1 - segoff; //(segend >= 0 ? segend - 1 - segoff : lnSegStartEnd[2 * s + 1] - segoff);
+
+			append(F2_buf, segoff);
+			append(F2_buf, (short)seg);
+			append(F2_buf, (short)0); // flags (no columns)
+			append(F2_buf, seglength);
+
+			append(F2_buf, fileid);
+			append(F2_buf, cnt);
+			append(F2_buf, cnt * 8 + 12); // size of block
+
+			for (int ln = 0; ln < cnt; ln++)
+			{
+				append(F2_buf, 0/*(int)sourceLine->offset[ln] - segoff*/);
+				append(F2_buf, (int)lineNo[ln] | 0x80000000); // mark as statement
+			}
+#if 1
+			append(F2_all, (int)0xf2);
+			append(F2_all, (int)F2_buf.size());
+			append(F2_all, F2_buf.data(), F2_buf.size());
+			align(F2_all, 4);
+#endif
+			F2_buf.resize(0);
+		}
+	}
+
+	std::vector<char> buf;
+	append(buf, (int)4);
+	if (F3_buf.size() > 0)
+	{
+		append(buf, (int)0xf3);
+		append(buf, (int)F3_buf.size());
+		append(buf, F3_buf.data(), F3_buf.size());
+		align(buf, 4);
+	}
+	if (F4_buf.size() > 0)
+	{
+		append(buf, (int)0xf4);
+		append(buf, (int)F4_buf.size());
+		append(buf, F4_buf.data(), F4_buf.size());
+		align(buf, 4);
+	}
+	if (F2_all.size() > 0)
+	{
+		append(buf, F2_all.data(), F2_all.size());
+		align(buf, 4);
+	}
+	int rc = globalMod()->AddSymbols((unsigned char *)buf.data(), buf.size());
+	if (rc <= 0)
+		return setError("cannot add line number info to module");
+
 	return true;
 }
 
@@ -687,7 +820,6 @@ bool PDB::addPublics(SymbolList sl)
 		//	break;
 		SYMBOL& sym = *symlist[i];
 		int rc;
-		char symname[kMaxNameLen];
 		//dsym2c((BYTE*)sym->data_v1.p_name.name, sym->data_v1.p_name.namelen, symname, sizeof(symname));
 		int type = translateType(sym.type);
 		if (mod)
